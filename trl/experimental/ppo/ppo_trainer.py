@@ -189,10 +189,10 @@ def truncate_response(stop_token_id: int, pad_token_id: int, responses: torch.Te
         `torch.Tensor`:
             The truncated responses tensor with pad tokens filled after the stop token.
     """
-    trunc_idxs = first_true_indices(responses == stop_token_id).unsqueeze(-1)
-    new_size = [1] * (len(responses.size()) - 1) + [responses.shape[1]]
+    trunc_idxs = first_true_indices(responses == stop_token_id).unsqueeze(-1) # first_true_indices(responses == stop_token_id): [batch_size,]
+    new_size = [1] * (len(responses.size()) - 1) + [responses.shape[1]] # [1, response_length]
     idxs = torch.arange(responses.shape[1], device=responses.device).view(*new_size)
-    postprocessed_responses = torch.masked_fill(responses, idxs > trunc_idxs, pad_token_id)
+    postprocessed_responses = torch.masked_fill(responses, idxs > trunc_idxs, pad_token_id) # x,x,x, [S], x,x,x -> x,x,x, [S], [PAD], [PAD], [PAD]
     return postprocessed_responses
 
 
@@ -706,6 +706,23 @@ class PPOTrainer(_BaseTrainer):
                     del logits
                     empty_cache()
 
+                    # We don't update the reference policy's parameters during training
+                    # because we want to harness the policy from drifting too much from the original policy(the initial model after pretraining).
+                    # Here are the reasons:
+                    # 1. reward hacking
+                    #    The reward model (which scores the policy's decision) is itself an imperfect approximation of the human preferences.
+                    #    It was trained on a limited dataset and has blind spots or biases in the understanding of human preferences.
+                    #    If we let the policy freely optimize against this imperfect reward model, it may have to learn the drawbacks of the reward model.
+                    #    For example, if the reward model prefers verbose responses, the policy may learn to generate verbose responses to maximize the reward.
+                    #    This could lead to overfitting to the reward model's biases, resulting always generating complex answers even when it should be simple.
+                    #    
+                    #    The KL constraint acts as a regularizer: "You can improve on the initial SFT model, but
+                    #    stay in the neighborhood of language that the SFT model would produce."
+                    # 2. Catastrophic forgetting
+                    #    The SFT model already has valuable capabilities -- grammar, factual knowledge, coherent reasoning,
+                    #    instruction following. Unrestricted RL could destroy these capabilities. 
+                    #    The model might find a high-reward shortcut that sacrifices general ability like factual accuracy.
+                    #    The KL penalty says: "Improve the reward, but don't forget how to be a good language model."
                     if ref_policy is None:
                         with self.null_ref_context():
                             ref_output = forward(model.policy, query_response, processing_class.pad_token_id)
@@ -743,6 +760,7 @@ class PPOTrainer(_BaseTrainer):
                     sequence_lengths.append(sequence_length)
                     scores.append(score)
                     values.append(value)
+                
                 responses = torch.cat(responses, 0)
                 postprocessed_responses = torch.cat(postprocessed_responses, 0)
                 logprobs = torch.cat(logprobs, 0)
@@ -755,7 +773,8 @@ class PPOTrainer(_BaseTrainer):
                 gc.collect()
 
                 # Response Processing 3. Filter completion. Ensure that the sample contains stop_token_id
-                # Completions not passing that filter will receive a lower score.
+                # Completions not passing that filter will receive a lower score. 
+                # if no EOS token at each sequence, -1.0 penalty
                 contain_eos_token = torch.any(postprocessed_responses == self.processing_class.eos_token_id, dim=-1)
                 if self.args.missing_eos_penalty is not None:
                     scores[~contain_eos_token] -= self.args.missing_eos_penalty
@@ -819,6 +838,15 @@ class PPOTrainer(_BaseTrainer):
                             mb_return = returns[micro_batch_inds]
                             mb_values = values[micro_batch_inds]
 
+                            # generation steps in a parallel manner
+                            # each logits vector is the generation vector given the query and the previous response
+                            # x_0   ----> logits_1 P(x_1|x_0)
+                            # x_1   ----> logits_2 P(x_2|x_0, x_1)
+                            # ...
+                            # x_{n} ----> logits_n P(y_0|x_0, x_1, ..., x_{n})
+                            # y_0   ----> logits_{n+1} P(y_1|x_0, x_1, ..., x_{n}, y_0)
+                            # ...
+                            # logits_i is the generation vector given the query and the previous response
                             output, vpred_temp = forward(model, mb_query_responses, processing_class.pad_token_id)
                             logits = output.logits[:, context_length - 1 : -1]
                             logits /= args.temperature + 1e-7
@@ -828,6 +856,11 @@ class PPOTrainer(_BaseTrainer):
                             )
                             vpred = vpred_temp[:, context_length - 1 : -1].squeeze(-1)
                             vpred = torch.masked_fill(vpred, padding_mask_p1[micro_batch_inds], 0)
+                            
+                            # If the value is far from the original value, we will discard it 
+                            # and the gradient with respect to parameters will be 0
+                            # we want the model to learn step by step without massive jumping. 
+                            # Just like scientific development, science develops step by step.
                             vpredclipped = torch.clamp(
                                 vpred,
                                 mb_values - args.cliprange_value,
@@ -880,6 +913,7 @@ class PPOTrainer(_BaseTrainer):
                     )
                     # fmt: on
                     empty_cache()
+            
             with torch.no_grad():
                 mean_kl = kl.sum(1).mean()
                 mean_entropy = (-logprobs).sum(1).mean()
